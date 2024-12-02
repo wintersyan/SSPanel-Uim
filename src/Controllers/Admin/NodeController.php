@@ -1,423 +1,360 @@
 <?php
 
+declare(strict_types=1);
+
 namespace App\Controllers\Admin;
 
-use App\Controllers\AdminController;
+use App\Controllers\BaseController;
+use App\Models\Config;
 use App\Models\Node;
-use App\Utils\{
-    Tools,
-    Radius,
-    Telegram,
-    CloudflareDriver,
-    DatatablesHelper
-};
-use App\Services\Config;
-use Slim\Http\{
-    Request,
-    Response
-};
+use App\Services\I18n;
+use App\Services\Notification;
+use App\Utils\Tools;
+use GuzzleHttp\Exception\GuzzleException;
 use Psr\Http\Message\ResponseInterface;
+use Slim\Http\Response;
+use Slim\Http\ServerRequest;
+use Smarty\Exception as SmartyException;
+use Telegram\Bot\Exceptions\TelegramSDKException;
+use function json_decode;
+use function json_encode;
+use function round;
+use function str_replace;
+use function trim;
 
-class NodeController extends AdminController
+final class NodeController extends BaseController
 {
-    /**
-     * @param Request   $request
-     * @param Response  $response
-     * @param array     $args
-     */
-    public function index($request, $response, $args): ResponseInterface
-    {
-        $table_config['total_column'] = array(
-            'op'                      => '操作',
-            'id'                      => 'ID',
-            'name'                    => '节点名称',
-            'type'                    => '显示与隐藏',
-            'sort'                    => '类型',
-            'server'                  => '节点地址',
-            'outaddress'              => '出口地址',
-            'node_ip'                 => '节点IP',
-            'info'                    => '节点信息',
-            'status'                  => '状态',
-            'traffic_rate'            => '流量比率',
-            'node_group'              => '节点群组',
-            'node_class'              => '节点等级',
-            'node_speedlimit'         => '节点限速/Mbps',
-            'node_bandwidth'          => '已走流量/GB',
-            'node_bandwidth_limit'    => '流量限制/GB',
-            'bandwidthlimit_resetday' => '流量重置日',
-            'node_heartbeat'          => '上一次活跃时间',
-            'custom_method'           => '自定义加密',
-            'custom_rss'              => '自定义协议以及混淆',
-            'mu_only'                 => '只启用单端口多用户'
-        );
-        $table_config['default_show_column'] = array('op', 'id', 'name', 'sort');
-        $table_config['ajax_url'] = 'node/ajax';
+    private static array $details = [
+        'field' => [
+            'op' => '操作',
+            'id' => '节点ID',
+            'name' => '名称',
+            'server' => '地址',
+            'type' => '状态',
+            'sort' => '类型',
+            'traffic_rate' => '倍率',
+            'is_dynamic_rate' => '动态倍率',
+            'dynamic_rate_type' => '动态倍率计算方式',
+            'node_class' => '等级',
+            'node_group' => '组别',
+            'node_bandwidth_limit' => '流量限制/GB',
+            'node_bandwidth' => '已用流量/GB',
+            'bandwidthlimit_resetday' => '重置日',
+        ],
+    ];
 
+    private static array $update_field = [
+        'name',
+        'server',
+        'traffic_rate',
+        'is_dynamic_rate',
+        'dynamic_rate_type',
+        'max_rate',
+        'max_rate_time',
+        'min_rate',
+        'min_rate_time',
+        'node_group',
+        'node_speedlimit',
+        'sort',
+        'node_class',
+        'node_bandwidth_limit',
+        'bandwidthlimit_resetday',
+    ];
+
+    /**
+     * 后台节点页面
+     *
+     * @throws SmartyException
+     */
+    public function index(ServerRequest $request, Response $response, array $args): ResponseInterface
+    {
         return $response->write(
             $this->view()
-                ->assign('table_config', $table_config)
-                ->display('admin/node/index.tpl')
+                ->assign('details', self::$details)
+                ->fetch('admin/node/index.tpl')
         );
     }
 
     /**
-     * @param Request   $request
-     * @param Response  $response
-     * @param array     $args
+     * 后台创建节点页面
+     *
+     * @throws SmartyException
      */
-    public function create($request, $response, $args): ResponseInterface
+    public function create(ServerRequest $request, Response $response, array $args): ResponseInterface
     {
         return $response->write(
             $this->view()
-                ->display('admin/node/create.tpl')
+                ->assign('update_field', self::$update_field)
+                ->fetch('admin/node/create.tpl')
         );
     }
 
     /**
-     * @param Request   $request
-     * @param Response  $response
-     * @param array     $args
+     * 后台添加节点
      */
-    public function add($request, $response, $args): ResponseInterface
+    public function add(ServerRequest $request, Response $response, array $args): ResponseInterface
     {
-        $node                   = new Node();
-        $node->name             = $request->getParam('name');
-        $node->server           = trim($request->getParam('server'));
-        $node->method           = $request->getParam('method');
-        $node->custom_method    = $request->getParam('custom_method');
-        $node->custom_rss       = $request->getParam('custom_rss');
-        $node->mu_only          = $request->getParam('mu_only');
-        $node->traffic_rate     = $request->getParam('rate');
-        $node->info             = $request->getParam('info');
-        $node->type             = $request->getParam('type');
-        $node->node_group       = $request->getParam('group');
-        $node->node_speedlimit  = $request->getParam('node_speedlimit');
-        $node->status           = $request->getParam('status');
-        $node->sort             = $request->getParam('sort');
+        $node = new Node();
 
-        $req_node_ip = trim($request->getParam('node_ip'));
-        if ($req_node_ip == '') {
-            $req_node_ip = $node->server;
-        }
+        $node->name = $request->getParam('name');
+        $node->node_group = $request->getParam('node_group');
+        $node->server = trim($request->getParam('server'));
+        $node->traffic_rate = $request->getParam('traffic_rate') ?? 1;
+        $node->is_dynamic_rate = $request->getParam('is_dynamic_rate') === 'true' ? 1 : 0;
+        $node->dynamic_rate_type = $request->getParam('dynamic_rate_type') ?? 0;
+        $node->dynamic_rate_config = json_encode([
+            'max_rate' => $request->getParam('max_rate') ?? 1,
+            'max_rate_time' => $request->getParam('max_rate_time') ?? 22,
+            'min_rate' => $request->getParam('min_rate') ?? 1,
+            'min_rate_time' => $request->getParam('min_rate_time') ?? 3,
+        ]);
 
-        $nodeSort = [2, 5, 9, 999];     // 无需更新 IP 的节点类型
-        if (!in_array($node->sort, $nodeSort)) {
-            $server_list = explode(';', $node->server);
-            if (!Tools::is_ip($server_list[0])) {
-                $node->node_ip = gethostbyname($server_list[0]);
-            } else {
-                $node->node_ip = $req_node_ip;
-            }
-            if ($node->node_ip == '') {
-                return $response->withJson(
-                    [
-                        'ret' => 0,
-                        'msg' => '获取节点IP失败，请检查您输入的节点地址是否正确！'
-                    ]
-                );
-            }
+        $custom_config = $request->getParam('custom_config') ?? '{}';
+
+        if ($custom_config !== '') {
+            $node->custom_config = $custom_config;
         } else {
-            $node->node_ip = '';
+            $node->custom_config = '{}';
         }
 
-        if ($node->sort == 1) {
-            Radius::AddNas($node->node_ip, $request->getParam('server'));
-        }
-        $node->node_class                 = $request->getParam('class');
-        $node->node_bandwidth_limit       = $request->getParam('node_bandwidth_limit') * 1024 * 1024 * 1024;
-        $node->bandwidthlimit_resetday    = $request->getParam('bandwidthlimit_resetday');
+        $node->node_speedlimit = $request->getParam('node_speedlimit');
+        $node->type = $request->getParam('type') === 'true' ? 1 : 0;
+        $node->sort = $request->getParam('sort');
+        $node->node_class = $request->getParam('node_class');
+        $node->node_bandwidth_limit = Tools::gbToB($request->getParam('node_bandwidth_limit'));
+        $node->bandwidthlimit_resetday = $request->getParam('bandwidthlimit_resetday');
+        $node->password = Tools::genRandomChar(32);
 
-        $node->save();
-
-        if ($_ENV['cloudflare_enable'] == true) {
-            $domain_name = explode('.' . $_ENV['cloudflare_name'], $node->server);
-            CloudflareDriver::updateRecord($domain_name[0], $node->node_ip);
-        }
-
-        if (Config::getconfig('Telegram.bool.AddNode')) {
-            Telegram::Send(
-                str_replace(
-                    '%node_name%',
-                    $request->getParam('name'),
-                    Config::getconfig('Telegram.string.AddNode')
-                )
-            );
+        if (! $node->save()) {
+            return $response->withJson([
+                'ret' => 0,
+                'msg' => '添加失败',
+            ]);
         }
 
-        return $response->withJson(
-            [
-                'ret' => 1,
-                'msg' => '节点添加成功'
-            ]
-        );
+        if (Config::obtain('im_bot_group_notify_add_node')) {
+            try {
+                Notification::notifyUserGroup(
+                    str_replace(
+                        '%node_name%',
+                        $request->getParam('name'),
+                        I18n::trans('bot.node_added', $_ENV['locale'])
+                    )
+                );
+            } catch (TelegramSDKException | GuzzleException) {
+                return $response->withJson([
+                    'ret' => 1,
+                    'msg' => '添加成功，但 IM Bot 通知失败',
+                    'node_id' => $node->id,
+                ]);
+            }
+        }
+
+        return $response->withJson([
+            'ret' => 1,
+            'msg' => '添加成功',
+            'node_id' => $node->id,
+        ]);
     }
 
     /**
-     * @param Request   $request
-     * @param Response  $response
-     * @param array     $args
+     * 后台编辑指定节点页面
+     *
+     * @throws SmartyException
      */
-    public function edit($request, $response, $args): ResponseInterface
+    public function edit(ServerRequest $request, Response $response, array $args): ResponseInterface
     {
-        $id = $args['id'];
-        $node = Node::find($id);
+        $node = (new Node())->find($args['id']);
+
+        $dynamic_rate_config = json_decode($node->dynamic_rate_config);
+        $node->max_rate = $dynamic_rate_config?->max_rate ?? 1;
+        $node->max_rate_time = $dynamic_rate_config?->max_rate_time ?? 22;
+        $node->min_rate = $dynamic_rate_config?->min_rate ?? 1;
+        $node->min_rate_time = $dynamic_rate_config?->min_rate_time ?? 3;
+
+        $node->node_bandwidth = Tools::autoBytes($node->node_bandwidth);
+        $node->node_bandwidth_limit = Tools::bToGB($node->node_bandwidth_limit);
+
         return $response->write(
             $this->view()
                 ->assign('node', $node)
-                ->display('admin/node/edit.tpl')
+                ->assign('update_field', self::$update_field)
+                ->fetch('admin/node/edit.tpl')
         );
     }
 
     /**
-     * @param Request   $request
-     * @param Response  $response
-     * @param array     $args
+     * 后台更新指定节点内容
      */
-    public function update($request, $response, $args): ResponseInterface
+    public function update(ServerRequest $request, Response $response, array $args): ResponseInterface
     {
-        $id                     = $args['id'];
-        $node                   = Node::find($id);
-        $node->name             = $request->getParam('name');
-        $node->node_group       = $request->getParam('group');
-        $node->server           = trim($request->getParam('server'));
-        $node->method           = $request->getParam('method');
-        $node->custom_method    = $request->getParam('custom_method');
-        $node->custom_rss       = $request->getParam('custom_rss');
-        $node->mu_only          = $request->getParam('mu_only');
-        $node->traffic_rate     = $request->getParam('rate');
-        $node->info             = $request->getParam('info');
-        $node->node_speedlimit  = $request->getParam('node_speedlimit');
-        $node->type             = $request->getParam('type');
-        $node->sort             = $request->getParam('sort');
+        $node = (new Node())->find($args['id']);
 
-        $req_node_ip = trim($request->getParam('node_ip'));
-        if ($req_node_ip == '') {
-            $req_node_ip = $node->server;
-        }
+        $node->name = $request->getParam('name');
+        $node->node_group = $request->getParam('node_group') ?? 0;
+        $node->server = trim($request->getParam('server'));
+        $node->traffic_rate = $request->getParam('traffic_rate') ?? 1;
+        $node->is_dynamic_rate = $request->getParam('is_dynamic_rate') === 'true' ? 1 : 0;
+        $node->dynamic_rate_type = $request->getParam('dynamic_rate_type') ?? 0;
+        $node->dynamic_rate_config = json_encode([
+            'max_rate' => $request->getParam('max_rate') ?? 1,
+            'max_rate_time' => $request->getParam('max_rate_time') ?? 0,
+            'min_rate' => $request->getParam('min_rate') ?? 1,
+            'min_rate_time' => $request->getParam('min_rate_time') ?? 0,
+        ]);
 
-        $success = true;
-        $nodeSort = [2, 5, 9, 999];     // 无需更新 IP 的节点类型
-        if (!in_array($node->sort, $nodeSort)) {
-            $server_list = explode(';', $node->server);
-            if (!Tools::is_ip($server_list[0])) {
-                $success = $node->changeNodeIp($server_list[0]);
-            } else {
-                $success = $node->changeNodeIp($req_node_ip);
-            }
+        $custom_config = $request->getParam('custom_config') ?? '{}';
+
+        if ($custom_config !== '') {
+            $node->custom_config = $custom_config;
         } else {
-            $node->node_ip = '';
+            $node->custom_config = '{}';
         }
 
-        if (!$success) {
-            return $response->withJson(
-                [
-                    'ret' => 0,
-                    'msg' => '更新节点IP失败，请检查您输入的节点地址是否正确！'
-                ]
-            );
+        $node->node_speedlimit = $request->getParam('node_speedlimit');
+        $node->type = $request->getParam('type') === 'true' ? 1 : 0;
+        $node->sort = $request->getParam('sort');
+        $node->node_class = $request->getParam('node_class');
+        $node->node_bandwidth_limit = Tools::gbToB($request->getParam('node_bandwidth_limit'));
+        $node->bandwidthlimit_resetday = $request->getParam('bandwidthlimit_resetday');
+
+        if (! $node->save()) {
+            return $response->withJson([
+                'ret' => 0,
+                'msg' => '修改失败',
+            ]);
         }
 
-        if (in_array($node->sort, array(0, 10, 11, 12))) {
-            Tools::updateRelayRuleIp($node);
-        }
-
-        if ($node->sort == 1) {
-            $SS_Node = Node::where('sort', '=', 0)->where('server', '=', $request->getParam('server'))->first();
-            if ($SS_Node != null) {
-                if ($SS_Node->node_heartbeat == 0 || time() - $SS_Node->node_heartbeat < 300) {
-                    Radius::AddNas(gethostbyname($request->getParam('server')), $request->getParam('server'));
-                }
-            } else {
-                Radius::AddNas(gethostbyname($request->getParam('server')), $request->getParam('server'));
+        if (Config::obtain('im_bot_group_notify_update_node')) {
+            try {
+                Notification::notifyUserGroup(
+                    str_replace(
+                        '%node_name%',
+                        $request->getParam('name'),
+                        I18n::trans('bot.node_updated', $_ENV['locale'])
+                    )
+                );
+            } catch (TelegramSDKException | GuzzleException) {
+                return $response->withJson([
+                    'ret' => 1,
+                    'msg' => '修改成功，但 IM Bot 通知失败',
+                ]);
             }
         }
 
-        $node->status                     = $request->getParam('status');
-        $node->node_class                 = $request->getParam('class');
-        $node->node_bandwidth_limit       = $request->getParam('node_bandwidth_limit') * 1024 * 1024 * 1024;
-        $node->bandwidthlimit_resetday    = $request->getParam('bandwidthlimit_resetday');
+        return $response->withJson([
+            'ret' => 1,
+            'msg' => '修改成功',
+        ]);
+    }
 
+    public function resetPassword(ServerRequest $request, Response $response, array $args): ResponseInterface
+    {
+        $node = (new Node())->find($args['id']);
+        $node->password = Tools::genRandomChar(32);
         $node->save();
 
-        if (Config::getconfig('Telegram.bool.UpdateNode')) {
-            Telegram::Send(
-                str_replace(
-                    '%node_name%',
-                    $request->getParam('name'),
-                    Config::getconfig('Telegram.string.UpdateNode')
-                )
-            );
-        }
+        return $response->withJson([
+            'ret' => 1,
+            'msg' => '重置节点通讯密钥成功',
+        ]);
+    }
 
-        return $response->withJson(
-            [
-                'ret' => 1,
-                'msg' => '修改成功'
-            ]
-        );
+    public function resetBandwidth(ServerRequest $request, Response $response, array $args): ResponseInterface
+    {
+        $node = (new Node())->find($args['id']);
+        $node->node_bandwidth = 0;
+        $node->save();
+
+        return $response->withJson([
+            'ret' => 1,
+            'msg' => '重置节点流量成功',
+        ]);
     }
 
     /**
-     * @param Request   $request
-     * @param Response  $response
-     * @param array     $args
+     * 后台删除指定节点
      */
-    public function delete($request, $response, $args): ResponseInterface
+    public function delete(ServerRequest $request, Response $response, array $args): ResponseInterface
     {
-        $id = $request->getParam('id');
-        $node = Node::find($id);
-        if ($node->sort == 1) {
-            Radius::DelNas($node->node_ip);
+        $node = (new Node())->find($args['id']);
+
+        if (! $node->delete()) {
+            return $response->withJson([
+                'ret' => 0,
+                'msg' => '删除失败',
+            ]);
         }
 
-        if (!$node->delete()) {
-            return $response->withJson(
-                [
-                    'ret' => 0,
-                    'msg' => '删除失败'
-                ]
-            );
-        }
-
-        if (Config::getconfig('Telegram.bool.DeleteNode')) {
-            Telegram::Send(
-                str_replace(
-                    '%node_name%',
-                    $node->name,
-                    Config::getconfig('Telegram.string.DeleteNode')
-                )
-            );
-        }
-
-        return $response->withJson(
-            [
-                'ret' => 1,
-                'msg' => '删除成功'
-            ]
-        );
-    }
-
-    /**
-     * @param Request   $request
-     * @param Response  $response
-     * @param array     $args
-     */
-    public function ajax($request, $response, $args): ResponseInterface
-    {
-        //得到排序的方式
-        $order        = $request->getParam('order')[0]['dir'];
-        //得到排序字段的下标
-        $order_column = $request->getParam('order')[0]['column'];
-        //根据排序字段的下标得到排序字段
-        $order_field  = $request->getParam('columns')[$order_column]['data'];
-        $limit_start  = $request->getParam('start');
-        $limit_length = $request->getParam('length');
-        $search       = $request->getParam('search')['value'];
-
-        if ($order_field == 'outaddress' || $order_field == 'op') {
-            $order_field = 'server';
-        }
-
-        $nodes          = [];
-        $query = Node::query();
-        if ($search) {
-            $v          = (int) (new DatatablesHelper())->query('select version()')[0]['version()'];
-            $like_str   = ($v < 8 ? 'LIKE' : 'LIKE binary');
-            $query->where('id', 'LIKE', "%$search%")
-                ->orwhere('name', 'LIKE', "%$search%")
-                ->orwhere('type', 'LIKE', "%$search%")
-                ->orwhere('sort', 'LIKE', "%$search%")
-                ->orwhere('server', 'LIKE', "%$search%")
-                ->orwhere('node_ip', 'LIKE', "%$search%")
-                ->orwhere('info', 'LIKE', "%$search%")
-                ->orwhere('status', 'LIKE', "%$search%")
-                ->orwhere('traffic_rate', 'LIKE', "%$search%")
-                ->orwhere('node_group', 'LIKE', "%$search%")
-                ->orwhere('node_class', 'LIKE', "%$search%")
-                ->orwhere('node_speedlimit', 'LIKE', "%$search%")
-                ->orwhere('node_bandwidth', 'LIKE', "%$search%")
-                ->orwhere('node_bandwidth_limit', 'LIKE', "%$search%")
-                ->orwhere('bandwidthlimit_resetday', 'LIKE', "%$search%")
-                ->orwhere('node_heartbeat', $like_str, "%$search%")
-                ->orwhere('custom_method', 'LIKE', "%$search%")
-                ->orwhere('custom_rss', 'LIKE', "%$search%")
-                ->orwhere('mu_only', 'LIKE', "%$search%");
-        }
-        $query_count = clone $query;
-        $nodes = $query->orderByRaw($order_field . ' ' . $order)
-            ->skip($limit_start)->limit($limit_length)
-            ->get();
-        $count_filtered = $query_count->count();
-
-        $data = [];
-        foreach ($nodes as $node) {
-            $tempdata = [];
-            $tempdata['op']   = '<a class="btn btn-brand" ' . ($node->sort == 999 ? 'disabled' : 'href="/admin/node/' . $node->id . '/edit"') . '>编辑</a>
-                <a class="btn btn-brand-accent" ' . ($node->sort == 999 ? 'disabled' : 'id="delete" value="' . $node->id . '" href="javascript:void(0);" onClick="delete_modal_show(\'' . $node->id . '\')"') . '>删除</a>';
-            $tempdata['id']   = $node->id;
-            $tempdata['name'] = $node->name;
-            $tempdata['type'] = ((bool) $node->type ? '显示' : '隐藏');
-            switch ($node->sort) {
-                case 0:
-                    $sort = 'Shadowsocks';
-                    break;
-                case 1:
-                    $sort = 'VPN/Radius基础';
-                    break;
-                case 2:
-                    $sort = 'SSH';
-                    break;
-                case 5:
-                    $sort = 'Anyconnect';
-                    break;
-                case 9:
-                    $sort = 'Shadowsocks - 单端口多用户';
-                    break;
-                case 10:
-                    $sort = 'Shadowsocks - 中转';
-                    break;
-                case 11:
-                    $sort = 'V2Ray 节点';
-                    break;
-                case 12:
-                    $sort = 'V2Ray - 中转';
-                    break;
-                case 13:
-                    $sort = 'Shadowsocks - V2Ray-Plugin&Obfs';
-                    break;
-                case 14:
-                    $sort = 'Trojan';
-                    break;
-                default:
-                    $sort = '系统保留';
+        if (Config::obtain('im_bot_group_notify_delete_node')) {
+            try {
+                Notification::notifyUserGroup(
+                    str_replace(
+                        '%node_name%',
+                        $node->name,
+                        I18n::trans('bot.node_deleted', $_ENV['locale'])
+                    )
+                );
+            } catch (TelegramSDKException | GuzzleException) {
+                return $response->withJson([
+                    'ret' => 1,
+                    'msg' => '删除成功，但 IM Bot 通知失败',
+                ]);
             }
-            $tempdata['sort']                       = $sort;
-            $tempdata['server']                     = $node->server;
-            $tempdata['outaddress']                 = $node->getOutServer();
-            $tempdata['node_ip']                    = $node->node_ip;
-            $tempdata['info']                       = $node->info;
-            $tempdata['status']                     = $node->status;
-            $tempdata['traffic_rate']               = $node->traffic_rate;
-            $tempdata['node_group']                 = $node->node_group;
-            $tempdata['node_class']                 = $node->node_class;
-            $tempdata['node_speedlimit']            = $node->node_speedlimit;
-            $tempdata['node_bandwidth']             = Tools::flowToGB($node->node_bandwidth);
-            $tempdata['node_bandwidth_limit']       = Tools::flowToGB($node->node_bandwidth_limit);
-            $tempdata['bandwidthlimit_resetday']    = $node->bandwidthlimit_resetday;
-            $tempdata['node_heartbeat']             = date('Y-m-d H:i:s', $node->node_heartbeat);
-            $tempdata['custom_method']              = ((bool) $node->custom_method ? '启用' : '关闭');
-            $tempdata['custom_rss']                 = ((bool) $node->custom_rss ? '启用' : '关闭');
-            $tempdata['mu_only']                    = ($node->mu_only == 1 ? '启用' : '关闭');
-
-            $data[] = $tempdata;
         }
-        $info = [
-            'draw'            => $request->getParam('draw'), // ajax请求次数，作为标识符
-            'recordsTotal'    => Node::count(),
-            'recordsFiltered' => $count_filtered,
-            'data'            => $data,
-        ];
 
-        return $response->withJson($info);
+        return $response->withJson([
+            'ret' => 1,
+            'msg' => '删除成功',
+        ]);
+    }
+
+    public function copy($request, $response, $args)
+    {
+        $old_node = (new Node())->find($args['id']);
+        $new_node = $old_node->replicate([
+            'node_bandwidth',
+        ]);
+        $new_node->name .= ' (副本)';
+        $new_node->node_bandwidth = 0;
+        $new_node->password = Tools::genRandomChar(32);
+
+        if (! $new_node->save()) {
+            return $response->withJson([
+                'ret' => 0,
+                'msg' => '复制失败',
+            ]);
+        }
+
+        return $response->withJson([
+            'ret' => 1,
+            'msg' => '复制成功',
+        ]);
+    }
+
+    /**
+     * 后台节点页面 AJAX
+     */
+    public function ajax(ServerRequest $request, Response $response, array $args): ResponseInterface
+    {
+        $nodes = (new Node())->orderBy('id', 'desc')->get();
+
+        foreach ($nodes as $node) {
+            $node->op = '<button class="btn btn-red" id="delete-node-' . $node->id . '" 
+            onclick="deleteNode(' . $node->id . ')">删除</button>
+            <button class="btn btn-orange" id="copy-node-' . $node->id . '" 
+            onclick="copyNode(' . $node->id . ')">复制</button>
+            <a class="btn btn-primary" href="/admin/node/' . $node->id . '/edit">编辑</a>';
+            $node->type = $node->type();
+            $node->sort = $node->sort();
+            $node->is_dynamic_rate = $node->isDynamicRate();
+            $node->dynamic_rate_type = $node->dynamicRateType();
+            $node->node_bandwidth = round(Tools::bToGB($node->node_bandwidth), 2);
+            $node->node_bandwidth_limit = Tools::bToGB($node->node_bandwidth_limit);
+        }
+
+        return $response->withJson([
+            'nodes' => $nodes,
+        ]);
     }
 }

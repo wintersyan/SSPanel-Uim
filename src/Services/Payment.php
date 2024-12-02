@@ -1,75 +1,88 @@
 <?php
 
-/**
- * Created by PhpStorm.
- * User: tonyzou
- * Date: 2018/9/24
- * Time: 下午7:07
- */
+declare(strict_types=1);
 
 namespace App\Services;
 
-use App\Services\Gateway\{
-    AopF2F,
-    Codepay,
-    PaymentWall,
-    SPay,
-    PAYJS,
-    YftPay,
-    BitPayX
-};
+use App\Utils\ClassHelper;
+use Psr\Http\Message\ResponseInterface;
 
-class Payment
+final class Payment
 {
-    public static function getClient()
+    public static function getAllPaymentMap(): array
     {
-        $method = $_ENV['payment_system'];
-        switch ($method) {
-            case ('codepay'):
-                return new Codepay();
-            case ('paymentwall'):
-                return new PaymentWall();
-            case ('spay'):
-                return new SPay();
-            case ('f2fpay'):
-                return new AopF2F();
-            case ('payjs'):
-                return new PAYJS($_ENV['payjs_key']);
-            case ('yftpay'):
-                return new YftPay();
-            case ('bitpayx'):
-                return new BitPayX($_ENV['bitpay_secret']);
-            default:
-                return null;
-        }
-    }
+        $payments = [];
 
-    public static function notify($request, $response, $args)
-    {
-        return self::getClient()->notify($request, $response, $args);
-    }
+        $helper = new ClassHelper();
+        $class_list = $helper->getClassesByNamespace('\\App\\Services\\Gateway\\');
 
-    public static function returnHTML($request, $response, $args)
-    {
-        return self::getClient()->getReturnHTML($request, $response, $args);
-    }
-
-    public static function purchaseHTML()
-    {
-        if (self::getClient() != null) {
-            return self::getClient()->getPurchaseHTML();
+        foreach ($class_list as $class) {
+            if (get_parent_class($class) === 'App\\Services\\Gateway\\Base') {
+                $payments[] = $class;
+            }
         }
 
-        return '';
+        return $payments;
     }
 
-    public static function getStatus($request, $response, $args)
+    public static function getPaymentsEnabled(): array
     {
-        return self::getClient()->getStatus($request, $response, $args);
+        return array_values(array_filter(Payment::getAllPaymentMap(), static function ($payment) {
+            return $payment::_enable();
+        }));
     }
 
-    public static function purchase($request, $response, $args)
+    public static function getPaymentMap(): array
     {
-        return self::getClient()->purchase($request, $response, $args);
+        $result = [];
+
+        foreach (self::getPaymentsEnabled() as $payment) {
+            $result[$payment::_name()] = $payment;
+        }
+
+        return $result;
+    }
+
+    public static function getPaymentByName($name): ?string
+    {
+        $all = self::getPaymentMap();
+
+        return $all[$name];
+    }
+
+    public static function notify($request, $response, $args): ResponseInterface
+    {
+        $payment = self::getPaymentByName($args['type']);
+
+        if ($payment !== null) {
+            $instance = new $payment();
+            return $instance->notify($request, $response, $args);
+        }
+
+        return $response->withStatus(404);
+    }
+
+    public static function returnHTML($request, $response, $args): ResponseInterface
+    {
+        $payment = self::getPaymentByName($args['type']);
+
+        if ($payment !== null) {
+            $instance = new $payment();
+            return $instance->getReturnHTML($request, $response, $args);
+        }
+
+        return $response->withStatus(404);
+    }
+
+    public static function purchase($request, $response, $args): ResponseInterface
+    {
+        $payment = self::getPaymentByName($args['type']);
+
+        if ($payment !== null) {
+            $instance = new $payment();
+            return $instance->purchase($request, $response, $args);
+        }
+
+        return $response->withStatus(404);
     }
 }

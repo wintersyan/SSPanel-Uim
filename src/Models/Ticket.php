@@ -1,28 +1,50 @@
 <?php
 
+declare(strict_types=1);
+
 namespace App\Models;
 
+use Illuminate\Database\Query\Builder;
+
 /**
- * Ticket Model
+ * @property int    $id       工单ID
+ * @property string $title    工单标题
+ * @property string $content  工单内容
+ * @property int    $userid   用户ID
+ * @property int    $datetime 创建时间
+ * @property string $status   工单状态
+ * @property string $type     工单类型
+ *
+ * @mixin Builder
  */
-class Ticket extends Model
+final class Ticket extends Model
 {
     protected $connection = 'default';
     protected $table = 'ticket';
 
-    public function datetime()
+    /**
+     * 工单类型
+     */
+    public function type(): string
     {
-        return date('Y-m-d H:i:s', $this->attributes['datetime']);
+        return match ($this->type) {
+            'howto' => '使用',
+            'billing' => '财务',
+            'account' => '账户',
+            default => '其他',
+        };
     }
 
-    public function User()
+    /**
+     * 工单状态
+     */
+    public function status(): string
     {
-        $user = User::where('id', $this->attributes['userid'])->first();
-        if ($user == null) {
-            self::where('id', '=', $this->attributes['id'])->delete();
-            return null;
-        }
-
-        return $user;
+        return match ($this->status) {
+            'closed' => '已结单',
+            'open_wait_user' => '等待用户回复',
+            'open_wait_admin' => '进行中',
+            default => '未知',
+        };
     }
 }

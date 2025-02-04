@@ -1,104 +1,149 @@
 <?php
 
+declare(strict_types=1);
+
 namespace App\Controllers;
 
-use App\Models\{
-    User,
-    PasswordReset
-};
-use App\Utils\Hash;
+use App\Models\Config;
+use App\Models\User;
+use App\Services\Cache;
+use App\Services\Captcha;
 use App\Services\Password;
+use App\Services\RateLimit;
+use App\Utils\Hash;
+use App\Utils\ResponseHelper;
+use Psr\Http\Client\ClientExceptionInterface;
+use Psr\Http\Message\ResponseInterface;
+use RedisException;
+use Slim\Http\Response;
+use Slim\Http\ServerRequest;
+use Smarty\Exception;
+use function strlen;
+use function strtolower;
 
-/***
- * Class Password
- * @package App\Controllers
- * 密码重置
- */
-class PasswordController extends BaseController
+final class PasswordController extends BaseController
 {
-    public function reset()
+    /**
+     * @throws Exception
+     */
+    public function reset(ServerRequest $request, Response $response, array $args): ResponseInterface
     {
-        return $this->view()->display('password/reset.tpl');
-    }
+        $captcha = [];
 
-    public function handleReset($request, $response, $args)
-    {
-        $email = $request->getParam('email');
-        // check limit
-
-        // send email
-        $user = User::where('email', $email)->first();
-        if ($user == null) {
-            $rs['ret'] = 0;
-            $rs['msg'] = '此邮箱不存在.';
-            return $response->getBody()->write(json_encode($rs));
-        }
-        $rs['ret'] = 1;
-        $rs['msg'] = '重置邮件已经发送,请检查邮箱.';
-        if (Password::sendResetEmail($email)) {
-            $res['msg'] = '邮件发送失败，请联系网站管理员。';
+        if (Config::obtain('enable_reset_password_captcha')) {
+            $captcha = Captcha::generate();
         }
 
-        return $response->getBody()->write(json_encode($rs));
+        return $response->write(
+            $this->view()
+                ->assign('captcha', $captcha)
+                ->fetch('password/reset.tpl')
+        );
     }
 
-    public function token($request, $response, $args)
+    public function handleReset(ServerRequest $request, Response $response, array $args): ResponseInterface
     {
-        $token = $args['token'];
-        return $this->view()->assign('token', $token)->display('password/token.tpl');
+        if (Config::obtain('enable_reset_password_captcha')) {
+            $ret = Captcha::verify($request->getParams());
+
+            if (! $ret) {
+                return ResponseHelper::error($response, '系统无法接受你的验证结果，请刷新页面后重试');
+            }
+        }
+
+        $email = strtolower($this->antiXss->xss_clean($request->getParam('email')));
+
+        if ($email === '') {
+            return ResponseHelper::error($response, '未填写邮箱');
+        }
+
+        if (! (new RateLimit())->checkRateLimit('email_request_ip', $request->getServerParam('REMOTE_ADDR')) ||
+            ! (new RateLimit())->checkRateLimit('email_request_address', $email)
+        ) {
+            return ResponseHelper::error($response, '你的请求过于频繁，请稍后再试');
+        }
+
+        $user = (new User())->where('email', $email)->first();
+        $msg = '如果你的账户存在于我们的数据库中，那么重置密码的链接将会发送到你账户所对应的邮箱';
+
+        if ($user !== null) {
+            try {
+                Password::sendResetEmail($email);
+            } catch (ClientExceptionInterface|RedisException) {
+                $msg = '邮件发送失败';
+            }
+        }
+
+        return ResponseHelper::success($response, $msg);
     }
 
-    public function handleToken($request, $response, $args)
+    /**
+     * @throws Exception
+     */
+    public function token(ServerRequest $request, Response $response, array $args)
     {
-        $tokenStr = $args['token'];
+        $token = $this->antiXss->xss_clean($args['token']);
+        $redis = (new Cache())->initRedis();
+
+        try {
+            $email = $redis->get('password_reset:' . $token);
+        } catch (RedisException) {
+            return $response->withStatus(302)->withHeader('Location', '/password/reset');
+        }
+
+        if (! $email) {
+            return $response->withStatus(302)->withHeader('Location', '/password/reset');
+        }
+
+        return $response->write(
+            $this->view()->fetch('password/token.tpl')
+        );
+    }
+
+    public function handleToken(ServerRequest $request, Response $response, array $args): ResponseInterface
+    {
+        $token = $this->antiXss->xss_clean($request->getParam('token'));
         $password = $request->getParam('password');
-        $repasswd = $request->getParam('repasswd');
+        $confirm_password = $request->getParam('confirm_password');
 
-        if ($password != $repasswd) {
-            $res['ret'] = 0;
-            $res['msg'] = '两次输入不符合';
-            return $response->getBody()->write(json_encode($res));
+        if ($password !== $confirm_password) {
+            return ResponseHelper::error($response, '两次输入不符合');
         }
 
         if (strlen($password) < 8) {
-            $res['ret'] = 0;
-            $res['msg'] = '密码太短啦';
-            return $response->getBody()->write(json_encode($res));
+            return ResponseHelper::error($response, '密码过短');
         }
 
-        // check token
-        $token = PasswordReset::where('token', $tokenStr)->where('expire_time', '>', time())->orderBy('id', 'desc')->first();
-        if ($token == null) {
-            $rs['ret'] = 0;
-            $rs['msg'] = '链接已经失效，请重新获取';
-            return $response->getBody()->write(json_encode($rs));
+        $redis = (new Cache())->initRedis();
+
+        try {
+            $email = $redis->get('password_reset:' . $token);
+            $redis->del('password_reset:' . $token);
+        } catch (RedisException) {
+            return ResponseHelper::error($response, '链接无效');
         }
 
-        $user = User::where('email', $token->email)->first();
-        if ($user == null) {
-            $rs['ret'] = 0;
-            $rs['msg'] = '链接已经失效，请重新获取';
-            return $response->getBody()->write(json_encode($rs));
+        if (! $email) {
+            return ResponseHelper::error($response, '链接无效');
         }
 
+        $user = (new User())->where('email', $email)->first();
+
+        if ($user === null) {
+            return ResponseHelper::error($response, '链接无效');
+        }
         // reset password
         $hashPassword = Hash::passwordHash($password);
         $user->pass = $hashPassword;
-        $user->ga_enable = 0;
 
-        if (!$user->save()) {
-            $rs['ret'] = 0;
-            $rs['msg'] = '重置失败，请重试';
-        } else {
-            $rs['ret'] = 1;
-            $rs['msg'] = '重置成功';
-            $user->clean_link();
-
-            // 禁止链接多次使用
-            $token->expire_time = time();
-            $token->save();
+        if (! $user->save()) {
+            return ResponseHelper::error($response, '重置失败，请重试');
         }
 
-        return $response->write(json_encode($rs));
+        if (Config::obtain('enable_forced_replacement')) {
+            $user->removeLink();
+        }
+
+        return ResponseHelper::success($response, '重置成功');
     }
 }

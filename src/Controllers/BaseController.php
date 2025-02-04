@@ -1,61 +1,91 @@
 <?php
 
+declare(strict_types=1);
+
 namespace App\Controllers;
 
 use App\Models\User;
-use App\Services\{
-    Auth,
-    View
-};
-use Slim\Http\Response;
-use Psr\Http\Message\ResponseInterface;
-use Smarty;
+use App\Services\Auth;
+use App\Services\View;
+use Smarty\Smarty;
+use Twig\Environment;
+use voku\helper\AntiXSS;
+use function microtime;
+use function round;
 
-/**
- * BaseController
- */
-class BaseController
+abstract class BaseController
 {
     /**
      * @var Smarty
      */
-    protected $view;
+    protected Smarty $view;
+
+    /**
+     * @var Environment
+     */
+    protected Environment $twig;
 
     /**
      * @var User
      */
-    protected $user;
+    protected User $user;
+
+    /**
+     * @var AntiXSS
+     */
+    protected AntiXSS $antiXss;
 
     /**
      * Construct page renderer
      */
     public function __construct()
     {
-        $this->view = View::getSmarty();
         $this->user = Auth::getUser();
+        $this->antiXss = new AntiXSS();
     }
 
     /**
      * Get smarty
-     *
-     * @return Smarty
      */
-    public function view()
+    public function view(): Smarty
     {
+        $this->view = View::getSmarty();
+
+        if (View::$connection) {
+            $this->view->assign(
+                'queryLog',
+                View::$connection
+                    ->connection('default')
+                    ->getQueryLog()
+            )->assign(
+                'optTime',
+                round((microtime(true) - View::$beginTime) * 1000, 2)
+            );
+        }
+
         return $this->view;
     }
 
-    // TODO: remove
     /**
-     * Output JSON
-     *
-     * @param Response      $response
-     * @param array|object  $resource
-     *
-     * @return ResponseInterface
+     * Get twig
      */
-    public function echoJson(Response $response, $resource)
+    public function twig(): Environment
     {
-        return $response->withJson($resource);
+        $this->twig = View::getTwig();
+
+        if (View::$connection) {
+            $this->twig->addGlobal(
+                'queryLog',
+                View::$connection
+                    ->connection('default')
+                    ->getQueryLog()
+            );
+            $this->twig->addGlobal(
+                'optTime',
+                round((microtime(true) - View::$beginTime) * 1000, 2)
+            );
+        }
+
+        return $this->twig;
     }
 }

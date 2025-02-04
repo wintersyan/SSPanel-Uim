@@ -1,323 +1,188 @@
 <?php
 
+declare(strict_types=1);
+
 namespace App\Controllers\User;
 
-use App\Controllers\UserController;
-use App\Models\{
-    User,
-    Ticket
-};
+use App\Controllers\BaseController;
+use App\Models\Config;
+use App\Models\Ticket;
+use App\Services\Notification;
+use App\Services\RateLimit;
+use App\Utils\ResponseHelper;
 use App\Utils\Tools;
-use voku\helper\AntiXSS;
-use Slim\Http\{
-    Request,
-    Response
-};
+use GuzzleHttp\Exception\GuzzleException;
+use Psr\Http\Client\ClientExceptionInterface;
 use Psr\Http\Message\ResponseInterface;
+use Slim\Http\Response;
+use Slim\Http\ServerRequest;
+use Smarty\Exception;
+use Telegram\Bot\Exceptions\TelegramSDKException;
+use function array_merge;
+use function count;
+use function json_decode;
+use function json_encode;
+use function nl2br;
+use function time;
 
-/**
- *  TicketController
- */
-class TicketController extends UserController
+final class TicketController extends BaseController
 {
     /**
-     * @param Request   $request
-     * @param Response  $response
-     * @param array     $args
+     * @throws Exception
      */
-    public function ticket($request, $response, $args): ?ResponseInterface
+    public function index(ServerRequest $request, Response $response, array $args): ResponseInterface
     {
-        if ($_ENV['enable_ticket'] != true) {
-            return null;
+        if (! Config::obtain('enable_ticket')) {
+            return $response->withRedirect('/user');
         }
-        $pageNum = $request->getQueryParams()['page'] ?? 1;
-        $tickets = Ticket::where('userid', $this->user->id)->where('rootid', 0)->orderBy('datetime', 'desc')->paginate(15, ['*'], 'page', $pageNum);
-        $tickets->setPath('/user/ticket');
 
-        if ($request->getParam('json') == 1) {
-            return $response->withJson(
-                [
-                    'ret'     => 1,
-                    'tickets' => $tickets
-                ]
-            );
+        $tickets = (new Ticket())->where('userid', $this->user->id)->orderBy('datetime', 'desc')->get();
+
+        foreach ($tickets as $ticket) {
+            $ticket->status = $ticket->status();
+            $ticket->type = $ticket->type();
+            $ticket->datetime = Tools::toDateTime((int) $ticket->datetime);
         }
-        $render = Tools::paginate_render($tickets);
 
         return $response->write(
             $this->view()
                 ->assign('tickets', $tickets)
-                ->assign('render', $render)
-                ->display('user/ticket.tpl')
+                ->fetch('user/ticket/index.tpl')
         );
     }
 
     /**
-     * @param Request   $request
-     * @param Response  $response
-     * @param array     $args
+     * @throws ClientExceptionInterface
+     * @throws TelegramSDKException
+     * @throws GuzzleException
      */
-    public function ticket_create($request, $response, $args): ResponseInterface
+    public function add(ServerRequest $request, Response $response, array $args): ResponseInterface
     {
-        return $response->write(
-            $this->view()
-                ->display('user/ticket_create.tpl')
-        );
-    }
+        $title = $request->getParam('title') ?? '';
+        $comment = $request->getParam('comment') ?? '';
+        $type = $request->getParam('type') ?? '';
 
-    /**
-     * @param Request   $request
-     * @param Response  $response
-     * @param array     $args
-     */
-    public function ticket_add($request, $response, $args): ResponseInterface
-    {
-        $title    = $request->getParam('title');
-        $content  = $request->getParam('content');
-        $markdown = $request->getParam('markdown');
-
-        if ($title == '' || $content == '') {
-            return $response->withJson(
-                [
-                    'ret' => 0,
-                    'msg' => '非法输入'
-                ]
-            );
+        if (! Config::obtain('enable_ticket') ||
+            $this->user->is_shadow_banned ||
+            ! (new RateLimit())->checkRateLimit('ticket', (string) $this->user->id) ||
+            $title === '' ||
+            $comment === '' ||
+            $type === ''
+        ) {
+            return ResponseHelper::error($response, '工单创建失败');
         }
 
-        if (strpos($content, 'admin') != false || strpos($content, 'user') != false) {
-            return $response->withJson(
-                [
-                    'ret' => 0,
-                    'msg' => '请求中有不当词语'
-                ]
-            );
-        }
+        $content = [
+            [
+                'comment_id' => 0,
+                'commenter_type' => 'user',
+                'commenter_name' => $this->user->user_name,
+                'comment' => $this->antiXss->xss_clean($comment),
+                'datetime' => time(),
+            ],
+        ];
 
-        $ticket  = new Ticket();
-        $antiXss = new AntiXSS();
-
-        $ticket->title    = $antiXss->xss_clean($title);
-        $ticket->content  = $antiXss->xss_clean($content);
-        $ticket->rootid   = 0;
-        $ticket->userid   = $this->user->id;
+        $ticket = new Ticket();
+        $ticket->title = $this->antiXss->xss_clean($title);
+        $ticket->content = json_encode($content);
+        $ticket->userid = $this->user->id;
         $ticket->datetime = time();
+        $ticket->status = 'open_wait_admin';
+        $ticket->type = $this->antiXss->xss_clean($type);
         $ticket->save();
 
-        if ($_ENV['mail_ticket'] == true && $markdown != '') {
-            $adminUser = User::where('is_admin', '=', '1')->get();
-            foreach ($adminUser as $user) {
-                $user->sendMail(
-                    $_ENV['appName'] . '-新工单被开启',
-                    'news/warn.tpl',
-                    [
-                        'text' => '管理员，有人开启了新的工单，请您及时处理。'
-                    ],
-                    []
-                );
-            }
-        }
-
-        if ($_ENV['useScFtqq'] == true && $markdown != '') {
-            $ScFtqq_SCKEY = $_ENV['ScFtqq_SCKEY'];
-            $postdata = http_build_query(
-                [
-                    'text' => $_ENV['appName'] . '-新工单被开启',
-                    'desp' => $markdown
-                ]
+        if (Config::obtain('mail_ticket')) {
+            Notification::notifyAdmin(
+                $_ENV['appName'] . '-新工单被开启',
+                '管理员，有人开启了新的工单，请你及时处理。'
             );
-            $opts = [
-                'http' => [
-                    'method' => 'POST',
-                    'header' => 'Content-type: application/x-www-form-urlencoded',
-                    'content' => $postdata
-                ]
-            ];
-            $context = stream_context_create($opts);
-            file_get_contents('https://sc.ftqq.com/' . $ScFtqq_SCKEY . '.send', false, $context);
         }
 
-        return $response->withJson(
-            [
-                'ret' => 1,
-                'msg' => '提交成功'
-            ]
-        );
+        return $response->withHeader('HX-Redirect', '/user/ticket/' . $ticket->id . '/view');
     }
 
     /**
-     * @param Request   $request
-     * @param Response  $response
-     * @param array     $args
+     * @throws GuzzleException
+     * @throws TelegramSDKException
+     * @throws ClientExceptionInterface
      */
-    public function ticket_update($request, $response, $args): ResponseInterface
+    public function reply(ServerRequest $request, Response $response, array $args): ResponseInterface
     {
-        $id       = $args['id'];
-        $content  = $request->getParam('content');
-        $status   = $request->getParam('status');
-        $markdown = $request->getParam('markdown');
+        $id = $args['id'];
+        $comment = $request->getParam('comment') ?? '';
 
-        if ($content == '' || $status == '') {
-            return $response->withJson(
-                [
-                    'ret' => 0,
-                    'msg' => '非法输入'
-                ]
-            );
+        if (! Config::obtain('enable_ticket') ||
+            $this->user->is_shadow_banned ||
+            $comment === ''
+        ) {
+            ResponseHelper::error($response, '工单回复失败');
         }
 
-        if (strpos($content, 'admin') != false || strpos($content, 'user') != false) {
-            return $response->withJson(
-                [
-                    'ret' => 0,
-                    'msg' => '请求中有不当词语'
-                ]
-            );
+        $ticket = (new Ticket())->where('id', $id)->where('userid', $this->user->id)->first();
+
+        if ($ticket === null) {
+            ResponseHelper::error($response, '工单不存在');
         }
 
-        $ticket_main = Ticket::where('id', '=', $id)->where('rootid', '=', 0)->first();
-        if ($ticket_main->userid != $this->user->id) {
-            $newResponse = $response->withStatus(302)->withHeader('Location', '/user/ticket');
-            return $newResponse;
-        }
+        $content_old = json_decode($ticket->content, true);
+        $content_new = [
+            [
+                'comment_id' => $content_old[count($content_old) - 1]['comment_id'] + 1,
+                'commenter_type' => 'user',
+                'commenter_name' => $this->user->user_name,
+                'comment' => $this->antiXss->xss_clean($comment),
+                'datetime' => time(),
+            ],
+        ];
 
-        if ($status == 1 && $ticket_main->status != $status) {
-            if ($_ENV['mail_ticket'] == true && $markdown != '') {
-                $adminUser = User::where('is_admin', '=', '1')->get();
-                foreach ($adminUser as $user) {
-                    $user->sendMail(
-                        $_ENV['appName'] . '-工单被重新开启',
-                        'news/warn.tpl',
-                        [
-                            'text' => '管理员，有人重新开启了<a href="' . $_ENV['baseUrl'] . '/admin/ticket/' . $ticket_main->id . '/view">工单</a>，请您及时处理。'
-                        ],
-                        []
-                    );
-                }
-            }
-            if ($_ENV['useScFtqq'] == true && $markdown != '') {
-                $ScFtqq_SCKEY = $_ENV['ScFtqq_SCKEY'];
-                $postdata = http_build_query(
-                    [
-                        'text' => $_ENV['appName'] . '-工单被重新开启',
-                        'desp' => $markdown
-                    ]
-                );
-                $opts = [
-                    'http' =>
-                    [
-                        'method' => 'POST',
-                        'header' => 'Content-type: application/x-www-form-urlencoded',
-                        'content' => $postdata
-                    ]
-                ];
-                $context = stream_context_create($opts);
-                file_get_contents('https://sc.ftqq.com/' . $ScFtqq_SCKEY . '.send', false, $context);
-                $useScFtqq = $_ENV['ScFtqq_SCKEY'];
-            }
-        } else {
-            if ($_ENV['mail_ticket'] == true && $markdown != '') {
-                $adminUser = User::where('is_admin', '=', '1')->get();
-                foreach ($adminUser as $user) {
-                    $user->sendMail(
-                        $_ENV['appName'] . '-工单被回复',
-                        'news/warn.tpl',
-                        [
-                            'text' => '管理员，有人回复了<a href="' . $_ENV['baseUrl'] . '/admin/ticket/' . $ticket_main->id . '/view">工单</a>，请您及时处理。'
-                        ],
-                        []
-                    );
-                }
-            }
-            if ($_ENV['useScFtqq'] == true && $markdown != '') {
-                $ScFtqq_SCKEY = $_ENV['ScFtqq_SCKEY'];
-                $postdata = http_build_query(
-                    [
-                        'text' => $_ENV['appName'] . '-工单被回复',
-                        'desp' => $markdown
-                    ]
-                );
-                $opts = [
-                    'http' =>
-                    [
-                        'method' => 'POST',
-                        'header' => 'Content-type: application/x-www-form-urlencoded',
-                        'content' => $postdata
-                    ]
-                ];
-                $context = stream_context_create($opts);
-                file_get_contents('https://sc.ftqq.com/' . $ScFtqq_SCKEY . '.send', false, $context);
-            }
-        }
-
-        $antiXss              = new AntiXSS();
-
-        $ticket               = new Ticket();
-        $ticket->title        = $antiXss->xss_clean($ticket_main->title);
-        $ticket->content      = $antiXss->xss_clean($content);
-        $ticket->rootid       = $ticket_main->id;
-        $ticket->userid       = $this->user->id;
-        $ticket->datetime     = time();
-        $ticket_main->status  = $status;
-
-        $ticket_main->save();
+        $ticket->content = json_encode(array_merge($content_old, $content_new));
+        $ticket->status = 'open_wait_admin';
         $ticket->save();
 
-        return $response->withJson(
-            [
-                'ret' => 1,
-                'msg' => '提交成功'
-            ]
-        );
+        if (Config::obtain('mail_ticket')) {
+            Notification::notifyAdmin(
+                $_ENV['appName'] . '-工单被回复',
+                '管理员，有人回复了 <a href="' .
+                $_ENV['baseUrl'] . '/admin/ticket/' . $ticket->id . '/view">#' . $ticket->id .
+                '</a> 工单，请你及时处理。'
+            );
+        }
+
+        return $response->withHeader('HX-Refresh', 'true');
     }
 
     /**
-     * @param Request   $request
-     * @param Response  $response
-     * @param array     $args
+     * @throws Exception
      */
-    public function ticket_view($request, $response, $args): ResponseInterface
+    public function detail(ServerRequest $request, Response $response, array $args): ResponseInterface
     {
-        $id           = $args['id'];
-        $ticket_main  = Ticket::where('id', '=', $id)->where('rootid', '=', 0)->first();
-
-        if ($ticket_main->userid != $this->user->id) {
-            if ($request->getParam('json') == 1) {
-                return $response->withJson(
-                    [
-                        'ret' => 0,
-                        'msg' => '这不是你的工单！'
-                    ]
-                );
-            }
-            $newResponse = $response->withStatus(302)->withHeader('Location', '/user/ticket');
-            return $newResponse;
+        if (! Config::obtain('enable_ticket')) {
+            return $response->withRedirect('/user');
         }
 
-        $pageNum = $request->getQueryParams()['page'] ?? 1;
+        $id = $args['id'];
+        $ticket = (new Ticket())->where('id', '=', $id)->where('userid', $this->user->id)->first();
 
-        $ticketset = Ticket::where('id', $id)->orWhere('rootid', '=', $id)->orderBy('datetime', 'desc')->paginate(5, ['*'], 'page', $pageNum);
-        $ticketset->setPath('/user/ticket/' . $id . '/view');
-
-        if ($request->getParam('json') == 1) {
-            foreach ($ticketset as $set) {
-                $set->username = $set->User()->user_name;
-                $set->datetime = $set->datetime();
-            }
-            return $response->withJson(
-                [
-                    'ret'     => 1,
-                    'tickets' => $ticketset
-                ]
-            );
+        if ($ticket === null) {
+            return $response->withRedirect('/user/ticket');
         }
-        $render = Tools::paginate_render($ticketset);
+
+        $comments = json_decode($ticket->content);
+
+        foreach ($comments as $comment) {
+            $comment->comment = nl2br($comment->comment);
+            $comment->datetime = Tools::toDateTime((int) $comment->datetime);
+        }
+
+        $ticket->status = $ticket->status();
+        $ticket->type = $ticket->type();
+        $ticket->datetime = Tools::toDateTime((int) $ticket->datetime);
+
         return $response->write(
             $this->view()
-                ->assign('ticketset', $ticketset)
-                ->assign('id', $id)
-                ->assign('render', $render)
-                ->display('user/ticket_view.tpl')
+                ->assign('ticket', $ticket)
+                ->assign('comments', $comments)
+                ->fetch('user/ticket/view.tpl')
         );
     }
 }

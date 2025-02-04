@@ -1,9 +1,9 @@
 <?php
 
 declare(strict_types=1);
-/**
- * To define global variable
- */
 
-define('BASE_PATH', __DIR__ . '/..');
-define('VERSION', '20180419');
+// Global constants
+const BASE_PATH = __DIR__ . '/..';
+const PANEL_NAME = 'NeXT-Panel';
+const PANEL_VERSION = '24.5.1';
+const OTA_API_URL = 'https://api.nextpanel.dev/v1/version/latest';

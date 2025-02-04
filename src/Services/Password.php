@@ -1,47 +1,37 @@
 <?php
 
+declare(strict_types=1);
 
 namespace App\Services;
 
-use App\Models\PasswordReset;
+use App\Models\Config;
 use App\Utils\Tools;
-use Exception;
+use Psr\Http\Client\ClientExceptionInterface;
+use RedisException;
 
-/***
- * Class Password
- * @package App\Services
- */
-class Password
+final class Password
 {
     /**
-     * @param $email string
-     * @return bool
+     * @throws ClientExceptionInterface
+     * @throws RedisException
      */
-    public static function sendResetEmail($email)
+    public static function sendResetEmail($email): void
     {
-        $pwdRst = new PasswordReset();
-        $pwdRst->email = $email;
-        $pwdRst->init_time = time();
-        $pwdRst->expire_time = time() + 3600 * 24; // @todo
-        $pwdRst->token = Tools::genRandomChar(64);
-        if (!$pwdRst->save()) {
-            return false;
-        }
-        $subject = $_ENV['appName'] . '重置密码';
-        $resetUrl = $_ENV['baseUrl'] . '/password/token/' . $pwdRst->token;
-        try {
-            Mail::send($email, $subject, 'password/reset.tpl', [
-                'resetUrl' => $resetUrl
-            ], [
-                //BASE_PATH.'/public/assets/email/styles.css'
-            ]);
-        } catch (Exception $e) {
-            return false;
-        }
-        return true;
-    }
+        $redis = (new Cache())->initRedis();
+        $token = Tools::genRandomChar(64);
 
-    public static function resetBy($token, $password)
-    {
+        $redis->setex('password_reset:' . $token, Config::obtain('email_password_reset_ttl'), $email);
+
+        $subject = $_ENV['appName'] . '-重置密码';
+        $resetUrl = $_ENV['baseUrl'] . '/password/token/' . $token;
+
+        Mail::send(
+            $email,
+            $subject,
+            'password_reset.tpl',
+            [
+                'resetUrl' => $resetUrl,
+            ]
+        );
     }
 }

@@ -1,163 +1,253 @@
 <?php
 
+declare(strict_types=1);
+
 namespace App\Controllers\Admin;
 
-use App\Controllers\AdminController;
-use App\Models\{
-    Ann,
-    User
-};
-use App\Utils\{
-    Telegram,
-    DatatablesHelper
-};
-use App\Services\Mail;
-use Ozdemir\Datatables\Datatables;
+use App\Controllers\BaseController;
+use App\Models\Ann;
+use App\Models\Config;
+use App\Models\EmailQueue;
+use App\Models\User;
+use App\Services\Notification;
+use App\Utils\Tools;
 use Exception;
+use GuzzleHttp\Exception\GuzzleException;
+use League\HTMLToMarkdown\HtmlConverter;
+use Psr\Http\Message\ResponseInterface;
+use Slim\Http\Response;
+use Slim\Http\ServerRequest;
+use Telegram\Bot\Exceptions\TelegramSDKException;
+use function in_array;
+use function strip_tags;
+use function strlen;
+use function time;
+use const PHP_EOL;
 
-class AnnController extends AdminController
+final class AnnController extends BaseController
 {
-    public function index($request, $response, $args)
+    private static array $details =
+        [
+            'field' => [
+                'op' => '操作',
+                'id' => 'ID',
+                'status' => '状态',
+                'sort' => '排序',
+                'date' => '日期',
+                'content' => '内容（节选）',
+            ],
+        ];
+
+    private static array $update_field = [
+        'status',
+        'sort',
+    ];
+
+    /**
+     * 后台公告页面
+     *
+     * @throws Exception
+     */
+    public function index(ServerRequest $request, Response $response, array $args): ResponseInterface
     {
-        $table_config['total_column'] = array('op' => '操作', 'id' => 'ID',
-            'date' => '日期', 'content' => '内容');
-        $table_config['default_show_column'] = array('op', 'id',
-            'date', 'content');
-        $table_config['ajax_url'] = 'announcement/ajax';
-        return $this->view()->assign('table_config', $table_config)->display('admin/announcement/index.tpl');
+        return $response->write(
+            $this->view()
+                ->assign('details', self::$details)
+                ->fetch('admin/announcement/index.tpl')
+        );
     }
 
-    public function create($request, $response, $args)
+    /**
+     * 后台公告创建页面
+     *
+     * @throws Exception
+     */
+    public function create(ServerRequest $request, Response $response, array $args): ResponseInterface
     {
-        return $this->view()->display('admin/announcement/create.tpl');
+        return $response->write(
+            $this->view()
+                ->assign('update_field', self::$update_field)
+                ->fetch('admin/announcement/create.tpl')
+        );
     }
 
-    public function add($request, $response, $args)
+    /**
+     * 后台添加公告
+     */
+    public function add(ServerRequest $request, Response $response, array $args): ResponseInterface
     {
-        $issend = $request->getParam('issend');
-        $PushBear = $request->getParam('PushBear');
-        $vip = $request->getParam('vip');
+        $status = (int) $request->getParam('status');
+        $sort = (int) $request->getParam('sort');
+        $email_notify_class = (int) $request->getParam('email_notify_class');
+        $email_notify = $request->getParam('email_notify') === 'true' ? 1 : 0;
         $content = $request->getParam('content');
-        $subject = $_ENV['appName'] . '-公告';
 
-        if ($request->getParam('page') == 1) {
-            $ann = new Ann();
-            $ann->date = date('Y-m-d H:i:s');
-            $ann->content = $content;
-            $ann->markdown = $request->getParam('markdown');
+        if ($content === '') {
+            return $response->withJson([
+                'ret' => 0,
+                'msg' => '内容不能为空',
+            ]);
+        }
 
-            if (!$ann->save()) {
-                $rs['ret'] = 0;
-                $rs['msg'] = '添加失败';
-                return $response->getBody()->write(json_encode($rs));
-            }
+        $ann = new Ann();
+        $ann->status = in_array($status, [0, 1, 2]) ? $status : 1;
+        $ann->sort = $sort > 999 || $sort < 0 ? 0 : $sort;
+        $ann->date = Tools::toDateTime(time());
+        $ann->content = $content;
+
+        if (! $ann->save()) {
+            return $response->withJson([
+                'ret' => 0,
+                'msg' => '公告保存失败',
+            ]);
         }
-        if ($PushBear == 1) {
-            $PushBear_sendkey = $_ENV['PushBear_sendkey'];
-            $postdata = http_build_query(
-                array(
-                    'text' => $subject,
-                    'desp' => $request->getParam('markdown'),
-                    'sendkey' => $PushBear_sendkey
-                )
-            );
-            file_get_contents('https://pushbear.ftqq.com/sub?' . $postdata, false);
-        }
-        if ($issend == 1) {
-            $beginSend = ($request->getParam('page') - 1) * $_ENV['sendPageLimit'];
-            $users = User::where('class', '>=', $vip)->skip($beginSend)->limit($_ENV['sendPageLimit'])->get();
+
+        if ($email_notify) {
+            $users = (new User())->where('class', '>=', $email_notify_class)
+                ->where('is_banned', '=', 0)
+                ->get();
+            $subject = $_ENV['appName'] . ' - 新公告发布';
+
             foreach ($users as $user) {
-                $user->sendMail(
+                (new EmailQueue())->add(
+                    $user->email,
                     $subject,
-                    'news/warn.tpl',
+                    'warn.tpl',
                     [
-                    'user' => $user, 'text' => $content],
-                    [],$_ENV['email_queue']
+                        'user' => $user,
+                        'text' => $content,
+                    ]
                 );
             }
-            if (count($users) == $_ENV['sendPageLimit']) {
-                $rs['ret'] = 2;
-                $rs['msg'] = $request->getParam('page') + 1;
-                return $response->getBody()->write(json_encode($rs));
+        }
+
+        if (Config::obtain('im_bot_group_notify_ann_create')) {
+            $converter = new HtmlConverter(['strip_tags' => true]);
+            $content = $converter->convert($content);
+
+            try {
+                Notification::notifyUserGroup('新公告：' . PHP_EOL . $content);
+            } catch (TelegramSDKException | GuzzleException) {
+                return $response->withJson([
+                    'ret' => 0,
+                    'msg' => $email_notify === 1 ? '公告添加成功，邮件发送成功，IM Bot 发送失败' : '公告添加成功，IM Bot 发送失败',
+                ]);
             }
         }
 
-        Telegram::SendMarkdown('新公告：' . PHP_EOL . $request->getParam('markdown'));
-        $rs['ret'] = 1;
-        if ($issend == 1 && $PushBear == 1) {
-            $rs['msg'] = '公告添加成功，邮件发送和PushBear推送成功';
-        }
-        if ($issend == 1 && $PushBear != 1) {
-            $rs['msg'] = '公告添加成功，邮件发送成功';
-        }
-        if ($issend != 1 && $PushBear == 1) {
-            $rs['msg'] = '公告添加成功，PushBear推送成功';
-        }
-        if ($issend != 1 && $PushBear != 1) {
-            $rs['msg'] = '公告添加成功';
-        }
-        return $response->getBody()->write(json_encode($rs));
+        return $response->withJson([
+            'ret' => 1,
+            'msg' => $email_notify === 1 ? '公告添加成功，邮件发送成功' : '公告添加成功',
+        ]);
     }
 
-    public function edit($request, $response, $args)
+    /**
+     * 后台编辑公告页面
+     *
+     * @throws Exception
+     */
+    public function edit(ServerRequest $request, Response $response, array $args): ResponseInterface
     {
-        $id = $args['id'];
-        $ann = Ann::find($id);
-        return $this->view()->assign('ann', $ann)->display('admin/announcement/edit.tpl');
+        return $response->write(
+            $this->view()
+                ->assign('ann', (new Ann())->find($args['id']))
+                ->assign('update_field', self::$update_field)
+                ->fetch('admin/announcement/edit.tpl')
+        );
     }
 
-    public function update($request, $response, $args)
+    /**
+     * 后台编辑公告提交
+     */
+    public function update(ServerRequest $request, Response $response, array $args): ResponseInterface
     {
-        $id = $args['id'];
-        $ann = Ann::find($id);
+        $status = (int) $request->getParam('status');
+        $sort = (int) $request->getParam('sort');
+        $content = $request->getParam('content');
 
-        $ann->content = $request->getParam('content');
-        $ann->markdown = $request->getParam('markdown');
-        $ann->date = date('Y-m-d H:i:s');
-
-        if (!$ann->save()) {
-            $rs['ret'] = 0;
-            $rs['msg'] = '修改失败';
-            return $response->getBody()->write(json_encode($rs));
+        if ($content === '') {
+            return $response->withJson([
+                'ret' => 0,
+                'msg' => '内容不能为空',
+            ]);
         }
 
-        Telegram::SendMarkdown('公告更新：' . PHP_EOL . $request->getParam('markdown'));
+        $ann = (new Ann())->find($args['id']);
 
-        $rs['ret'] = 1;
-        $rs['msg'] = '修改成功';
-        return $response->getBody()->write(json_encode($rs));
-    }
-
-
-    public function delete($request, $response, $args)
-    {
-        $id = $request->getParam('id');
-        $ann = Ann::find($id);
-        if (!$ann->delete()) {
-            $rs['ret'] = 0;
-            $rs['msg'] = '删除失败';
-            return $response->getBody()->write(json_encode($rs));
+        if ($ann === null) {
+            return $response->withJson([
+                'ret' => 0,
+                'msg' => '公告不存在',
+            ]);
         }
-        $rs['ret'] = 1;
-        $rs['msg'] = '删除成功';
-        return $response->getBody()->write(json_encode($rs));
+
+        $ann->status = in_array($status, [0, 1, 2]) ? $status : 1;
+        $ann->sort = $sort > 999 || $sort < 0 ? 0 : $sort;
+        $ann->content = $content;
+        $ann->date = Tools::toDateTime(time());
+
+        if (! $ann->save()) {
+            return $response->withJson([
+                'ret' => 0,
+                'msg' => '公告更新失败',
+            ]);
+        }
+
+        if (Config::obtain('im_bot_group_notify_ann_update')) {
+            $converter = new HtmlConverter(['strip_tags' => true]);
+            $content = $converter->convert($ann->content);
+
+            try {
+                Notification::notifyUserGroup('公告更新：' . PHP_EOL . $content);
+            } catch (TelegramSDKException | GuzzleException) {
+                return $response->withJson([
+                    'ret' => 0,
+                    'msg' => '公告更新成功，IM Bot 发送失败',
+                ]);
+            }
+        }
+
+        return $response->withJson([
+            'ret' => 1,
+            'msg' => '公告更新成功',
+        ]);
     }
 
-    public function ajax($request, $response, $args)
+    /**
+     * 后台删除公告
+     */
+    public function delete(ServerRequest $request, Response $response, array $args): ResponseInterface
     {
-        $datatables = new Datatables(new DatatablesHelper());
-        $datatables->query('Select id as op,id,date,content from announcement');
+        if ((new Ann())->find($args['id'])->delete()) {
+            return $response->withJson([
+                'ret' => 1,
+                'msg' => '删除成功',
+            ]);
+        }
 
-        $datatables->edit('op', static function ($data) {
-            return '<a class="btn btn-brand" href="/admin/announcement/' . $data['id'] . '/edit">编辑</a>
-                    <a class="btn btn-brand-accent" id="delete" value="' . $data['id'] . '" href="javascript:void(0);" onClick="delete_modal_show(\'' . $data['id'] . '\')">删除</a>';
-        });
+        return $response->withJson([
+            'ret' => 0,
+            'msg' => '删除失败',
+        ]);
+    }
 
-        $datatables->edit('DT_RowId', static function ($data) {
-            return 'row_1_' . $data['id'];
-        });
+    /**
+     * 后台公告页面 AJAX
+     */
+    public function ajax(ServerRequest $request, Response $response, array $args): ResponseInterface
+    {
+        $anns = (new Ann())->orderBy('id')->get();
 
-        $body = $response->getBody();
-        $body->write($datatables->generate());
+        foreach ($anns as $ann) {
+            $ann->op = '<button class="btn btn-red" id="delete-announcement-' . $ann->id . '" 
+            onclick="deleteAnn(' . $ann->id . ')">删除</button>
+            <a class="btn btn-primary" href="/admin/announcement/' . $ann->id . '/edit">编辑</a>';
+            $ann->status = $ann->status();
+            $ann->content = strlen($ann->content) > 40 ? mb_substr(strip_tags($ann->content), 0, 40, 'UTF-8') . '...' : $ann->content;
+        }
+
+        return $response->withJson([
+            'anns' => $anns,
+        ]);
     }
 }

@@ -1,42 +1,55 @@
 <?php
 
+declare(strict_types=1);
+
 namespace App\Models;
 
-class DetectLog extends Model
+use Illuminate\Database\Query\Builder;
+
+/**
+ * @property int $id       检测记录ID
+ * @property int $user_id  用户ID
+ * @property int $list_id  规则ID
+ * @property int $datetime 检测时间
+ * @property int $node_id  节点ID
+ * @property int $status   状态
+ *
+ * @mixin Builder
+ */
+final class DetectLog extends Model
 {
     protected $connection = 'default';
     protected $table = 'detect_log';
 
-    public function DetectRule()
+    /**
+     * 节点
+     */
+    public function node(): ?Node
     {
-        $rule = DetectRule::where('id', $this->attributes['list_id'])->first();
-        if ($rule == null) {
-            self::where('id', '=', $this->attributes['id'])->delete();
-            return null;
-        }
-
-        return $rule;
+        return (new Node())->find($this->node_id);
     }
 
-    public function User()
+    /**
+     * 节点名
+     */
+    public function nodeName(): string
     {
-        $user = User::where('id', $this->attributes['user_id'])->first();
-        if ($user == null) {
-            self::where('id', '=', $this->attributes['id'])->delete();
-            return null;
-        }
-
-        return $user;
+        return $this->node() === null ? '节点不存在' : $this->node()->name;
     }
 
-    public function Node()
+    /**
+     * 规则
+     */
+    public function rule(): ?DetectRule
     {
-        $node = Node::where('id', $this->attributes['node_id'])->first();
-        if ($node == null) {
-            self::where('id', '=', $this->attributes['id'])->delete();
-            return null;
-        }
+        return (new DetectRule())->find($this->list_id);
+    }
 
-        return $node;
+    /**
+     * 规则名
+     */
+    public function ruleName(): string
+    {
+        return $this->rule() === null ? '规则不存在' : $this->rule()->name;
     }
 }
